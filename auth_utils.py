@@ -1,11 +1,12 @@
 import os
+from typing import Optional
 from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential,TokenCredential
 from openai import AzureOpenAI
- 
+
 def get_auth_mode() -> str:
     return os.getenv("AUTH_MODE", "managed").lower()
- 
+
 # ---------- Azure AI Search ----------
 def get_search_credential() -> "TokenCredential|AzureKeyCredential":
     mode = get_auth_mode()
@@ -15,16 +16,16 @@ def get_search_credential() -> "TokenCredential|AzureKeyCredential":
             raise ValueError("SEARCH_API_KEY missing in apikey mode")
         return AzureKeyCredential(key)
     return DefaultAzureCredential()
- 
+
 # ---------- AzureOpenAI ----------
 def get_openai_client() -> AzureOpenAI:
     from dotenv import load_dotenv
     load_dotenv(override=True)
- 
+
     endpoint = os.getenv("OPENAI_ENDPOINT_URL")
     if not endpoint:
         raise ValueError("OPENAI_ENDPOINT_URL missing")
- 
+
     mode = get_auth_mode()
     if mode == "apikey":
         api_key = os.getenv("OPENAI_API_KEY")
@@ -44,3 +45,29 @@ def get_openai_client() -> AzureOpenAI:
         azure_endpoint=endpoint,
         api_version="2024-02-01"
     )
+
+# ---------- Azure AI Content Safety ----------
+def get_content_safety_client() -> Optional["ContentSafetyClient"]:
+    """
+    Create Azure AI Content Safety client using either API key or Managed Identity.
+    Returns None if endpoint is not configured, so callers can no-op gracefully.
+    """
+    try:
+        from azure.ai.contentsafety import ContentSafetyClient
+    except Exception:
+        return None
+
+    endpoint = os.getenv("CONTENT_SAFETY_ENDPOINT")
+    if not endpoint:
+        return None
+
+    mode = get_auth_mode()
+    if mode == "apikey":
+        key = os.getenv("CONTENT_SAFETY_KEY")
+        if not key:
+            return None
+        return ContentSafetyClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+
+    # managed identity
+    credential = DefaultAzureCredential()
+    return ContentSafetyClient(endpoint=endpoint, credential=credential)
