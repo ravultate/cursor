@@ -13,7 +13,7 @@ import time
 import re
 from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential
-from auth_utils import get_search_credential,get_openai_client
+from auth_utils import get_search_credential,get_openai_client,get_content_safety_client
 
 load_dotenv()
 
@@ -355,6 +355,7 @@ class AgenticRAGOrchestrator:
         self.search_client = search_client
         self.openai_client = openai_client
         self.deployment_name = deployment_name
+        self.safety_client = get_content_safety_client()
         
         # Initialize agents
         self.query_planner = QueryPlanner(openai_client, deployment_name)
@@ -366,6 +367,32 @@ class AgenticRAGOrchestrator:
         """Process query through the complete agentic pipeline"""
         
         start_time = time.time()
+
+        # Optional input safety gate
+        if self.safety_client:
+            try:
+                from azure.ai.contentsafety.models import AnalyzeTextOptions, TextCategory
+                analysis = self.safety_client.analyze_text(
+                    AnalyzeTextOptions(text=query, categories=[
+                        TextCategory.HATE, TextCategory.SEXUAL, TextCategory.VIOLENCE, TextCategory.HARASSMENT
+                    ])
+                )
+                # Simple thresholding: block if any severity >= 2
+                if any(cat.severity and cat.severity >= 2 for cat in analysis.categories_analysis):
+                    return {
+                        "query": query,
+                        "answer": "I cannot process this request due to content safety policies.",
+                        "query_analysis": {},
+                        "search_results": [],
+                        "context_validation": {"is_sufficient": False, "reason": "Blocked by content safety"},
+                        "most_relevant_pages": [],
+                        "confidence": 0.0,
+                        "sources_used": 0,
+                        "processing_time": time.time() - start_time,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            except Exception as e:
+                logger.warning(f"Content safety input check failed: {e}")
         
         # Step 1: Query Planning
         query_analysis = self.query_planner.analyze_query(query, conversation_history)
@@ -401,6 +428,46 @@ class AgenticRAGOrchestrator:
         answer_result = self.answer_agent.generate_answer(
             query, search_results, conversation_history, query_analysis
         )
+
+        # Optional groundedness check using a deterministic critic
+        try:
+            context_text = "\n\n".join([doc.get("content", "") for doc in search_results[:6]])
+            critic_prompt = (
+                "You are a strict verifier. Determine if the ANSWER is fully supported by the CONTEXT quotes.\n"
+                "Respond with exactly one word: SUPPORTED or UNSUPPORTED.\n\nCONTEXT:\n" + context_text + "\n\nANSWER:\n" + answer_result["answer"]
+            )
+            critic = self.openai_client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[{"role": "user", "content": critic_prompt}],
+                temperature=0.0,
+                max_tokens=3
+            )
+            grounded = "SUPPORTED" in (critic.choices[0].message.content or "")
+            if not grounded:
+                answer_result["answer"] = (
+                    "I don't have enough evidence in the indexed documents to confidently answer this. "
+                    "Please rephrase or provide more context."
+                )
+                answer_result["confidence"] = 0.0
+        except Exception as e:
+            logger.warning(f"Groundedness check failed: {e}")
+
+        # Optional output safety gate
+        if self.safety_client:
+            try:
+                from azure.ai.contentsafety.models import AnalyzeTextOptions, TextCategory
+                out_analysis = self.safety_client.analyze_text(
+                    AnalyzeTextOptions(text=answer_result["answer"], categories=[
+                        TextCategory.HATE, TextCategory.SEXUAL, TextCategory.VIOLENCE, TextCategory.HARASSMENT
+                    ])
+                )
+                if any(cat.severity and cat.severity >= 2 for cat in out_analysis.categories_analysis):
+                    answer_result["answer"] = (
+                        "I cannot return the generated content due to content safety policies."
+                    )
+                    answer_result["confidence"] = 0.0
+            except Exception as e:
+                logger.warning(f"Content safety output check failed: {e}")
         
         # Step 5: Compile final response
         processing_time = time.time() - start_time

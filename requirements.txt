@@ -13,3 +13,4 @@ openpyxl
 streamlit_msal
 requests
 xlrd
+azure-ai-contentsafety

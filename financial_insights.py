@@ -22,7 +22,8 @@ from docx.shared import Inches as DocxInches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential
-from auth_utils import get_search_credential,get_openai_client
+from auth_utils import get_search_credential,get_openai_client,get_content_safety_client
+from safety_utils import is_text_safe, enforce_output_safety, groundedness_check
 
 load_dotenv()
 
@@ -485,6 +486,10 @@ class FinancialInsightsAgent:
         state that clearly. Focus on factual information and specific data points.
         """
         
+        # Input safety gate
+        if not is_text_safe(question):
+            return "Question blocked by content safety policies."
+
         try:
             response = self.openai_client.chat.completions.create(
                 model=self.deployment_name,
@@ -492,9 +497,20 @@ class FinancialInsightsAgent:
                 max_tokens=1000,
                 temperature=0.2
             )
-            
-            return response.choices[0].message.content
-            
+
+            answer = response.choices[0].message.content
+
+            # Groundedness check
+            contexts = [doc.get("content", "") for doc in search_results[:6]]
+            if not groundedness_check(self.openai_client, self.deployment_name, answer, contexts):
+                answer = (
+                    "I don't have enough evidence in the indexed documents to confidently answer this. "
+                    "Please rephrase or provide more context."
+                )
+
+            # Output safety
+            return enforce_output_safety(answer)
+
         except Exception as e:
             logger.error(f"Error generating bulk answer: {str(e)}")
             return f"Error generating answer: {str(e)}"
