@@ -1,8 +1,12 @@
 import os
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential,TokenCredential
 from openai import AzureOpenAI
+
+if TYPE_CHECKING:
+    # For type checkers only; avoids runtime import requirement
+    from azure.ai.contentsafety import ContentSafetyClient
 
 def get_auth_mode() -> str:
     return os.getenv("AUTH_MODE", "managed").lower()
