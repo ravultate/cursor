@@ -1,3 +1,4 @@
+
 import streamlit as st
 from streamlit_option_menu import option_menu
 import login
@@ -123,9 +124,13 @@ if selected == "⚙️ Data Pipeline" :#and Action == "Sharepoint Authentication
             app.main()
     # If file uploaded, show ingest button
     if "Select File Upload" in st.session_state.selected_action:
-        st.info("A file has been uploaded. Click below to ingest data.")
-        if st.button("🚀 Ingest Data", type="primary"):
-            app.data_pipeline_upload()
+        if "access_token" not in st.session_state or not st.session_state.access_token:
+            st.error("❌ Please login first before accessing the data pipeline.")
+            st.info("👈 Use the Login tab to authenticate with Microsoft.")
+        else:
+            st.info("A file has been uploaded. Click below to ingest data.")
+            if st.button("🚀 Ingest Data", type="primary"):
+                app.data_pipeline_upload()
 # if selected == "⚙️ Data Pipeline":
 #     if "Select File Upload" in st.session_state.selected_action: #and Action == "Select File Upload":
 #         app.upload_main()
@@ -207,7 +212,7 @@ st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: #666; font-size: 0.9rem; margin-top: 2rem;'>
-        🤖Agentic RAG System | Powered by Azure AI Search + OpenAI | Financial Due Diligence Ready
+        🤖Agentic RAG System | Powered by Azure AI Search  OpenAI | Financial Due Diligence Ready
     </div>
     """,
     unsafe_allow_html=True

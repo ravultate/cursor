@@ -4,10 +4,14 @@ import time
 import json
 import logging
 from typing import List, Dict
+from io import BytesIO
 import requests
 import fitz  # PyMuPDF
 import streamlit as st
 from dotenv import load_dotenv
+from docx import Document
+from pptx import Presentation
+import pandas as pd
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import ResourceNotFoundError
 from azure.search.documents import SearchClient
@@ -100,6 +104,10 @@ def download_pdf(drive_id: str, file_id: str, access_token: str) -> bytes:
                 raise
             time.sleep(2 ** attempt)
 
+def download_file_content(drive_id: str, file_id: str, access_token: str) -> bytes:
+    """Generic download for any file type from SharePoint."""
+    return download_pdf(drive_id, file_id, access_token)
+
 def extract_pdf_text(pdf_bytes: bytes) -> List[tuple]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_text = []
@@ -113,6 +121,76 @@ def extract_pdf_text(pdf_bytes: bytes) -> List[tuple]:
             logger.warning("Error extracting text from page %s: %s", page_num + 1, e)
     doc.close()
     return pages_text
+
+def extract_docx_text(docx_bytes: bytes) -> List[tuple]:
+    try:
+        document = Document(BytesIO(docx_bytes))
+        text_lines = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+        joined = "\n".join(text_lines)
+        return [(1, joined)] if joined.strip() else []
+    except Exception as e:
+        logger.warning("Error extracting DOCX text: %s", e)
+        return []
+
+def extract_pptx_text(pptx_bytes: bytes) -> List[tuple]:
+    try:
+        prs = Presentation(BytesIO(pptx_bytes))
+        pages = []
+        for idx, slide in enumerate(prs.slides, start=1):
+            texts = []
+            for shape in slide.shapes:
+                if hasattr(shape, "has_text_frame") and shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        line = "".join(run.text for run in paragraph.runs).strip()
+                        if line:
+                            texts.append(line)
+            slide_text = "\n".join(texts)
+            if slide_text.strip():
+                pages.append((idx, slide_text))
+        return pages
+    except Exception as e:
+        logger.warning("Error extracting PPTX text: %s", e)
+        return []
+
+def extract_csv_text(csv_bytes: bytes) -> List[tuple]:
+    try:
+        # Let pandas detect encoding; fallback handled by pandas
+        df = pd.read_csv(BytesIO(csv_bytes))
+        df = df.fillna("")
+        text = df.to_csv(index=False)
+        return [(1, text)] if text.strip() else []
+    except Exception as e:
+        logger.warning("Error extracting CSV text: %s", e)
+        return []
+
+def extract_excel_text(excel_bytes: bytes) -> List[tuple]:
+    try:
+        xls = pd.ExcelFile(BytesIO(excel_bytes))
+        pages: List[tuple] = []
+        for i, sheet in enumerate(xls.sheet_names, start=1):
+            df = xls.parse(sheet)
+            df = df.fillna("")
+            text = f"Sheet: {sheet}\n" + df.to_csv(index=False)
+            if text.strip():
+                pages.append((i, text))
+        return pages
+    except Exception as e:
+        logger.warning("Error extracting Excel text: %s", e)
+        return []
+
+def extract_text_by_extension(file_name: str, file_bytes: bytes) -> List[tuple]:
+    ext = os.path.splitext(file_name)[1].lower()
+    if ext == ".pdf":
+        return extract_pdf_text(file_bytes)
+    if ext == ".docx":
+        return extract_docx_text(file_bytes)
+    if ext == ".pptx":
+        return extract_pptx_text(file_bytes)
+    if ext in (".xlsx", ".xls"):
+        return extract_excel_text(file_bytes)
+    if ext == ".csv":
+        return extract_csv_text(file_bytes)
+    return []
 
 def intelligent_chunk_text(text: str, max_chunk_size: int = 1000, overlap: int = 200):
     if not text.strip():
@@ -131,7 +209,7 @@ def intelligent_chunk_text(text: str, max_chunk_size: int = 1000, overlap: int =
             chunks.append(current_chunk.strip())
             current_chunk = (current_chunk[-overlap:] + " " + sentence) if overlap and len(current_chunk) > overlap else sentence
         else:
-            current_chunk += (". " if current_chunk else "") + sentence
+            current_chunk = (". " if current_chunk else "") + sentence
     
     if current_chunk:
         chunks.append(current_chunk.strip())
@@ -228,7 +306,7 @@ def upload_to_search_index_batch(index_name: str, docs: List[Dict], credential:N
         batch = docs[i:i + batch_size]
         try:
             results = client.upload_documents(documents=batch)
-            uploaded += sum(1 for r in results if r.succeeded)
+            uploaded = sum(1 for r in results if r.succeeded)
             failed = [r for r in results if not r.succeeded]
             if failed:
                 logger.warning("Batch %s: %s docs failed", i // batch_size + 1, len(failed))
@@ -285,7 +363,7 @@ def render_empty_folder_message(current_folder_name: str):
     st.markdown("""
     <div class="empty-folder-container">
         <h3>📂 Empty Folder</h3>
-        <p>No PDF files found in this folder: <strong>{}</strong></p>
+        <p>No supported files found in this folder: <strong>{}</strong></p>
         <p>💡 <em>You can navigate back to explore other folders or go up to the parent directory.</em></p>
     </div>
     """.format(current_folder_name), unsafe_allow_html=True)
@@ -300,7 +378,7 @@ def render_empty_folder_message(current_folder_name: str):
                 st.session_state.folder_stack.pop()
                 st.rerun()
         else:
-            st.info("You are in the root directory. Navigate to subfolders to find PDF files.")
+            st.info("You are in the root directory. Navigate to subfolders to find supported files.")
 
 # ──────────── ENHANCED FOLDER & FILE BROWSING LOGIC ────────────
 
@@ -341,10 +419,20 @@ def browse_sharepoint_folders_and_files(site_id: str, access_token: str):
         render_empty_folder_message(current_folder_name)
         return [], drive_id
     
-    # Separate folders and PDF files
+    # Separate folders and supported files
     folders = [item for item in children if item.get("folder") is not None]
-    files = [item for item in children if item.get("file") is not None and 
-             item["file"].get("mimeType", "") == "application/pdf"]
+    allowed_mime_types = {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+        "text/csv",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
+        "application/vnd.ms-excel",  # xls
+    }
+    files = [
+        item for item in children
+        if item.get("file") is not None and item["file"].get("mimeType", "") in allowed_mime_types
+    ]
     
     # Store file mapping for this folder
     st.session_state.folder_file_mapping[current_folder_id] = files
@@ -360,7 +448,7 @@ def browse_sharepoint_folders_and_files(site_id: str, access_token: str):
             with folder_cols[col_idx]:
                 folder_name = folder["name"]
                 # Truncate long folder names for display
-                display_name = folder_name if len(folder_name) <= 20 else folder_name[:17] + "..."
+                display_name = folder_name if len(folder_name) <= 20 else folder_name[:17] +  "..."
                 
                 if st.button(
                     f"📂 {display_name}", 
@@ -373,8 +461,8 @@ def browse_sharepoint_folders_and_files(site_id: str, access_token: str):
         
         st.markdown("---")
     
-    # Display PDF files section
-    st.markdown('<h3 class="section-header">📄 PDF Files ({} found)</h3>'.format(len(files)), unsafe_allow_html=True)
+    # Display files section
+    st.markdown('<h3 class="section-header">📄 Files ({} found)</h3>'.format(len(files)), unsafe_allow_html=True)
     
     if files:
         # Get current selections for this folder
@@ -389,17 +477,17 @@ def browse_sharepoint_folders_and_files(site_id: str, access_token: str):
         with col1:
             file_names = [file["name"] for file in files]
             selected_files = st.multiselect(
-                "Select PDF files to process:",
+                "Select files to process:",
                 options=file_names,
                 default=current_selections,
                 key=f"file_select_{current_folder_id}",
-                help="Select one or more PDF files to include in processing"
+                help="Select one or more files to include in processing"
             )
             # Update session state
             st.session_state.file_selections[current_folder_id] = selected_files
 
         with col2:
-            if st.button("✅ Select All", help="Select all PDF files in this folder", key=f"select_all_{current_folder_id}", use_container_width=True):
+            if st.button("✅ Select All", help="Select all supported files in this folder", key=f"select_all_{current_folder_id}", use_container_width=True):
                 st.session_state.file_selections[current_folder_id] = file_names
                 st.rerun()
             if st.button("❌ Clear All", help="Clear all selections in this folder", key=f"clear_all_{current_folder_id}", use_container_width=True):
@@ -488,7 +576,7 @@ def main():
         st.info("💡 **How to get started:**")
         st.markdown("""
         1. 📁 **Navigate folders:** Click on folder buttons to explore directories
-        2. 📄 **Select files:** Use checkboxes to select PDF files from any folder
+        2. 📄 **Select files:** Use checkboxes to select supported files from any folder
         3. ✅ **Quick select:** Use 'Select All' or 'Clear All' for convenience
         4. 🚀 **Process:** Click 'Start Processing' when you have files selected
         """)
@@ -501,7 +589,7 @@ def main():
 
     # Metrics row
     metrics_row = st.columns([1, 1, 1])
-    metrics_row[0].metric("PDFs Selected", len(pdf_files))
+    metrics_row[0].metric("Files Selected", len(pdf_files))
     metrics_row[1].metric("Folders Explored", len(st.session_state.folder_file_mapping))
     metrics_row[2].metric("Selections", sum(len(v) for v in st.session_state.file_selections.values()))
 
@@ -510,13 +598,13 @@ def main():
     # Action buttons row
     action_row = st.columns([2, 1])
     with action_row[0]:
-        st.success(f"✅ {len(pdf_files)} PDF file(s) selected and ready for processing")
+        st.success(f"✅ {len(pdf_files)} file(s) selected and ready for processing")
     with action_row[1]:
         start_processing = st.button(
             "🚀 Start Processing All Selected Files",
             type="primary",
             use_container_width=True,
-            help="Begin processing all selected PDF files from all folders"
+            help="Begin processing all selected files from all folders"
         )
 
     st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
@@ -565,7 +653,7 @@ def main():
     #      api_version="2024-02-01"
     #  )
     
-    openai_client = get_openai_client
+    openai_client = get_openai_client()
     docs_to_upload = []
     total_files = len(pdf_files)
     
@@ -592,12 +680,12 @@ def main():
         current_file_metric.metric("📄 Current File", f"{i}/{total_files}")
         
         try:
-            # Download and process PDF
+            # Download and process file
             with st.spinner(f"⬇️ Downloading {fname}..."):
-                pdf_bytes = download_pdf(drive_id, fid, access_token)
+                file_bytes = download_file_content(drive_id, fid, access_token)
             
             with st.spinner(f"📖 Extracting text from {fname}..."):
-                pages_text = extract_pdf_text(pdf_bytes)
+                pages_text = extract_text_by_extension(fname, file_bytes)
             
             if not pages_text:
                 st.warning(f"⚠️ No text found in {fname} - skipping")
@@ -623,11 +711,11 @@ def main():
                         "page_number": page_num,
                         "file_name": fname,
                         "chunk_id": f"page_{page_num}_chunk_{cidx}",
-                        "document_type": "pdf",
+                        "document_type": os.path.splitext(fname)[1].lower().lstrip('.'),
                         "last_modified": file_meta.get("lastModifiedDateTime", "2024-01-01T00:00:00Z")
                     })
             
-            successful_files += 1
+            successful_files = 1
             st.success(f"✅ Successfully processed {fname}")
             
         except Exception as e:
@@ -701,7 +789,10 @@ def main():
 
 def load_pdf_file():
 
-    uploaded_file = st.file_uploader("Upload pdf file", type=["pdf"])
+    uploaded_file = st.file_uploader(
+        "Upload file",
+        type=["pdf", "docx", "pptx", "csv", "xlsx", "xls"]
+    )
 
     return uploaded_file
 def sanitize_document_key(key: str) -> str:
@@ -722,28 +813,29 @@ def sanitize_document_key(key: str) -> str:
     return base64_encoded_key  # Return base64-encoded key to ensure safety
 def upload_main():
     
-    # Create a text input for the user's email
-    email_id = st.text_input("Enter your Email:")
+    # Prefer SSO-derived email if available
+    default_email = st.session_state.get("user_email", "")
+    email_id = st.text_input("Your Email", value=default_email, disabled=bool(default_email))
 
-    # Create a submit button
-    if st.button("Submit"):
-        # Check if the email field is not empty
-        if email_id.strip():
-            st.success(f"Hello, {email_id}!")
-        else:
-            st.error("Please enter your email. This field is mandatory.")
+    # # Optional: support username/password authentication for upload as requested
+    # with st.expander("Use username/password for upload (optional)"):
+    #     username = st.text_input("Username", key="basic_user")
+    #     password = st.text_input("Password", type="password", key="basic_pass")
+    #     if username and password:
+    #         st.session_state["upload_basic_auth"] = {"username": username, "password": password}
+    #         st.info("Basic credentials captured for upload session.")
 
     pdf_files = load_pdf_file()
 
     # Only save uploaded file and email to session state, do NOT process here
-    if pdf_files is not None and email_id.strip():
+    if pdf_files is not None and (email_id.strip() or st.session_state.get("user_email")):
         st.session_state["uploaded_pdf_file"] = pdf_files
-        st.session_state["uploaded_email_id"] = email_id
+        st.session_state["uploaded_email_id"] = email_id or st.session_state.get("user_email", "")
         st.success("File uploaded and saved! You can now go to the Data Pipeline tab to run ingestion.")
     elif pdf_files is not None:
-        st.warning("Please enter your email before uploading the file.")
+        st.warning("Email required: please sign in or enter your email above.")
     else:
-        st.info("Please upload a PDF file.")
+        st.info("Please upload a supported file (pdf, docx, pptx, csv, xlsx, xls).")
 
 def data_pipeline_upload():
     import streamlit as st
@@ -764,7 +856,7 @@ def data_pipeline_upload():
     #      api_version="2024-02-01"
     #  )
     
-    openai_client = get_openai_client
+    openai_client = get_openai_client()
     site_name = email_id.split("@")[0] if "@" in email_id else email_id
     index_name = f"{site_name.lower()}-enhanced-rag-index"
 
@@ -781,8 +873,8 @@ def data_pipeline_upload():
     file_id = file_name
     status_text.text(f"📄 Processing {file_name}")
     try:
-        pdf_bytes = pdf_files.read()
-        pages_text = extract_pdf_text(pdf_bytes)
+        file_bytes = pdf_files.read()
+        pages_text = extract_text_by_extension(file_name, file_bytes)
         for page_num, page_text in pages_text:
             if not page_text.strip():
                 continue
@@ -799,7 +891,7 @@ def data_pipeline_upload():
                     "page_number": page_num,
                     "file_name": file_name,
                     "chunk_id": f"page_{page_num}_chunk_{chunk_idx}",
-                    "document_type": "pdf",
+                    "document_type": os.path.splitext(file_name)[1].lower().lstrip('.'),
                 }
                 docs_to_upload.append(doc)
         progress_bar.progress(total_files)
@@ -840,3 +932,4 @@ def data_pipeline_upload():
 
 if __name__ == "__main__":
     main()
+
