@@ -1,0 +1,15 @@
+streamlit
+streamlit-option-menu
+python-dotenv
+azure-search-documents
+azure-identity
+azure-core
+openai
+PyMuPDF
+python-pptx
+python-docx
+pandas
+openpyxl
+streamlit_msal
+requests
+xlrd
