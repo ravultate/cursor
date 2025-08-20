@@ -1,3 +1,4 @@
+(cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF'
 diff --git a/login 13.py b/login 13.py
 --- a/login 13.py
 +++ b/login 13.py
@@ -219,3 +220,5 @@ diff --git a/login 13.py b/login 13.py
 +        st.warning("File uploaded! 👉 Please go to the Data Pipeline tab to run ingestion.")
 +    # Return the selected action
 +    return st.session_state.selected_action
+EOF
+)
